@@ -4,6 +4,9 @@ WARMUP_ITRS = Integer(ENV.fetch('WARMUP_ITRS', 15))
 MIN_BENCH_ITRS = Integer(ENV.fetch('MIN_BENCH_ITRS', 10))
 MIN_BENCH_TIME = Integer(ENV.fetch('MIN_BENCH_TIME', 10))
 
+# Number of full GCs to run after the benchmark before measuring retained (live) objects.
+RETAINED_GC_RUNS = Integer(ENV.fetch('RETAINED_GC_RUNS', 3))
+
 puts RUBY_DESCRIPTION
 
 def realtime
@@ -40,11 +43,18 @@ def run_benchmark(_num_itrs_hint, **, &block)
   major_counts = []
   minor_counts = []
   gc_heap_deltas = []
+  alloc_counts = []
   total_time = 0
   num_itrs = 0
 
   has_marking = GC.stat.key?(:marking_time)
   has_sweeping = GC.stat.key?(:sweeping_time)
+
+  # Boot allocations (VM + harness startup) are captured at harness load time, before the
+  # benchmark file runs its own setup. See BOOT_ALLOCATED_OBJECTS below.
+  puts "Boot allocations (VM + harness): %s objects (%s live)" % [
+    format_number(BOOT_ALLOCATED_OBJECTS), format_number(BOOT_LIVE_OBJECTS)
+  ]
 
   header = "itr:   time"
   header << "   marking" if has_marking
@@ -53,6 +63,7 @@ def run_benchmark(_num_itrs_hint, **, &block)
   header << "     major"
   header << "     minor"
   header << "  maj/min"
+  header << "%16s" % "allocs"
   puts header
 
   begin
@@ -71,6 +82,7 @@ def run_benchmark(_num_itrs_hint, **, &block)
     count_delta = gc_after[:count] - gc_before[:count]
     major_delta = gc_after[:major_gc_count] - gc_before[:major_gc_count]
     minor_delta = gc_after[:minor_gc_count] - gc_before[:minor_gc_count]
+    alloc_delta = gc_after[:total_allocated_objects] - gc_before[:total_allocated_objects]
     ratio_str = minor_delta > 0 ? "%.2f" % (major_delta.to_f / minor_delta) : "-"
 
     itr_str = "%4s %6s" % ["##{num_itrs}:", "#{time_ms}ms"]
@@ -80,6 +92,7 @@ def run_benchmark(_num_itrs_hint, **, &block)
     itr_str << " %9d" % major_delta
     itr_str << " %9d" % minor_delta
     itr_str << "%9s" % ratio_str
+    itr_str << "%16s" % format_number(alloc_delta)
     puts itr_str
 
     times << time
@@ -89,6 +102,7 @@ def run_benchmark(_num_itrs_hint, **, &block)
     gc_counts << count_delta
     major_counts << major_delta
     minor_counts << minor_delta
+    alloc_counts << alloc_delta
     gc_heap_deltas << gc_stat_heap_delta(heap_before, heap_after)
     total_time += time
   end until num_itrs >= WARMUP_ITRS + MIN_BENCH_ITRS and total_time >= MIN_BENCH_TIME
@@ -109,11 +123,22 @@ def run_benchmark(_num_itrs_hint, **, &block)
   extra["gc_major_count_bench"] = major_counts[bench_range]
   extra["gc_minor_count_warmup"] = minor_counts[warmup_range]
   extra["gc_minor_count_bench"] = minor_counts[bench_range]
+  extra["gc_allocated_objects_warmup"] = alloc_counts[warmup_range]
+  extra["gc_allocated_objects_bench"] = alloc_counts[bench_range]
   extra["gc_stat_heap_deltas"] = gc_heap_deltas[bench_range]
+  extra["boot_allocated_objects"] = BOOT_ALLOCATED_OBJECTS
+  extra["boot_live_objects"] = BOOT_LIVE_OBJECTS
 
-  # Snapshot heap utilisation after benchmark
+  # Settle the heap with a few full GCs, then measure retained (live) objects: the objects
+  # the benchmark holds onto once the dust settles.
+  RETAINED_GC_RUNS.times { GC.start(full_mark: true, immediate_sweep: true) }
+  retained_stat = GC.stat
+  retained_objects = retained_stat[:total_allocated_objects] - retained_stat[:total_freed_objects]
+  extra["retained_objects"] = retained_objects
+  extra["retained_objects_since_boot"] = retained_objects - BOOT_LIVE_OBJECTS
+
+  # Snapshot heap utilisation after the full GCs above.
   if GC.respond_to?(:stat_heap)
-    GC.start(full_mark: true)
     heap_snapshot = GC.stat_heap
     extra["gc_heap_final"] = heap_snapshot.transform_values { |v| v.is_a?(Hash) ? v.dup : v }
   end
@@ -124,6 +149,12 @@ def run_benchmark(_num_itrs_hint, **, &block)
   if non_warmups.size > 1
     non_warmups_ms = ((non_warmups.sum / non_warmups.size) * 1000.0).to_i
     puts "Average of last #{non_warmups.size}, non-warmup iters: #{non_warmups_ms}ms"
+
+    alloc_bench = alloc_counts[bench_range]
+    if alloc_bench && !alloc_bench.empty?
+      avg_alloc = alloc_bench.sum / alloc_bench.size
+      puts "Average allocations per iteration: %s objects" % format_number(avg_alloc)
+    end
 
     if has_marking
       mark_bench = marking_times[bench_range]
@@ -137,6 +168,13 @@ def run_benchmark(_num_itrs_hint, **, &block)
       puts "Average sweeping time: %.1fms" % avg_sweep
     end
   end
+
+  puts "Boot allocations (VM + harness): %s objects (%s live)" % [
+    format_number(BOOT_ALLOCATED_OBJECTS), format_number(BOOT_LIVE_OBJECTS)
+  ]
+  puts "Retained objects (after %d full GCs): %s objects (%s since boot)" % [
+    RETAINED_GC_RUNS, format_number(retained_objects), format_number(retained_objects - BOOT_LIVE_OBJECTS)
+  ]
 
   # Print heap utilisation table
   if heap_snapshot
@@ -161,3 +199,11 @@ def run_benchmark(_num_itrs_hint, **, &block)
     end
   end
 end
+
+# Capture allocation counts once the harness has fully loaded but before the benchmark file
+# defines its classes or runs its setup. This makes "boot" mean VM + harness startup only,
+# independent of the benchmark's own pre-benchmark allocations. (Benchmarks require this
+# harness via harness/loader before doing anything else.)
+boot_stat = GC.stat
+BOOT_ALLOCATED_OBJECTS = boot_stat[:total_allocated_objects]
+BOOT_LIVE_OBJECTS = BOOT_ALLOCATED_OBJECTS - boot_stat[:total_freed_objects]
