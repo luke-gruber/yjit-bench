@@ -7,6 +7,10 @@ MIN_BENCH_TIME = Integer(ENV.fetch('MIN_BENCH_TIME', 10))
 # Number of full GCs to run after the benchmark before measuring retained (live) objects.
 RETAINED_GC_RUNS = Integer(ENV.fetch('RETAINED_GC_RUNS', 3))
 
+# Custom GC.stat fields present only in some Ruby builds. Read from the GC.stat hash (rather
+# than GC.stat(key), which raises on builds without the key) and reported when present.
+CUSTOM_GC_STAT_KEYS = %i[fstrings_swept fstrings_created fstring_table_rebuilds]
+
 puts RUBY_DESCRIPTION
 
 def realtime
@@ -70,7 +74,12 @@ def run_benchmark(_num_itrs_hint, **, &block)
     gc_before = GC.stat
     heap_before = gc_stat_heap_snapshot
 
+    # Bracket the block as tightly as possible so `allocs` counts only the objects allocated
+    # since the start of this iteration's work, excluding the harness's own GC.stat and
+    # heap-snapshot bookkeeping above.
+    alloc_before = GC.stat(:total_allocated_objects)
     time = realtime(&block)
+    alloc_after = GC.stat(:total_allocated_objects)
     num_itrs += 1
 
     gc_after = GC.stat
@@ -82,7 +91,7 @@ def run_benchmark(_num_itrs_hint, **, &block)
     count_delta = gc_after[:count] - gc_before[:count]
     major_delta = gc_after[:major_gc_count] - gc_before[:major_gc_count]
     minor_delta = gc_after[:minor_gc_count] - gc_before[:minor_gc_count]
-    alloc_delta = gc_after[:total_allocated_objects] - gc_before[:total_allocated_objects]
+    alloc_delta = alloc_after - alloc_before
     ratio_str = minor_delta > 0 ? "%.2f" % (major_delta.to_f / minor_delta) : "-"
 
     itr_str = "%4s %6s" % ["##{num_itrs}:", "#{time_ms}ms"]
@@ -135,7 +144,11 @@ def run_benchmark(_num_itrs_hint, **, &block)
   retained_stat = GC.stat
   retained_objects = retained_stat[:total_allocated_objects] - retained_stat[:total_freed_objects]
   extra["retained_objects"] = retained_objects
-  extra["retained_objects_since_boot"] = retained_objects - BOOT_LIVE_OBJECTS
+
+  # Save any custom GC.stat fields this build exposes (see CUSTOM_GC_STAT_KEYS).
+  CUSTOM_GC_STAT_KEYS.each do |key|
+    extra[key.to_s] = retained_stat[key] if retained_stat.key?(key)
+  end
 
   # Snapshot heap utilisation after the full GCs above.
   if GC.respond_to?(:stat_heap)
@@ -172,9 +185,13 @@ def run_benchmark(_num_itrs_hint, **, &block)
   puts "Boot allocations (VM + harness): %s objects (%s live)" % [
     format_number(BOOT_ALLOCATED_OBJECTS), format_number(BOOT_LIVE_OBJECTS)
   ]
-  puts "Retained objects (after %d full GCs): %s objects (%s since boot)" % [
-    RETAINED_GC_RUNS, format_number(retained_objects), format_number(retained_objects - BOOT_LIVE_OBJECTS)
+  puts "Retained objects (after %d full GCs): %s objects" % [
+    RETAINED_GC_RUNS, format_number(retained_objects)
   ]
+  CUSTOM_GC_STAT_KEYS.each do |key|
+    next unless retained_stat.key?(key)
+    puts "%s: %s" % [key.to_s.tr("_", " "), format_number(retained_stat[key])]
+  end
 
   # Print heap utilisation table
   if heap_snapshot
